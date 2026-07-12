@@ -1,19 +1,116 @@
 import express from 'express';
 import { pool } from './db.js';
 import { notifyNewAppointment } from './notifications.js';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  // Tokens are sent as: "Authorization: Bearer <token>"
+  // If there's no header, or it doesn't start with "Bearer ", reject immediately.
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    // jwt.verify checks the signature AND expiry in one step. If the token
+    // was tampered with, or signed with a different secret, or expired,
+    // this throws -- caught below.
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Attach the decoded user info to the request object itself, so any
+    // route handler further down the chain can access req.user without
+    // needing to re-verify anything.
+    req.user = decoded;
+
+    next(); // proceed to the actual route handler
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
 
 const app = express();
 const PORT = 3000;
 
 app.use(express.json());
 
+// Public health check -- no auth needed.
 app.get('/', (req, res) => {
   res.send('Appointment SaaS API is running');
 });
 
-// ===== CUSTOMERS =====
+// ===== AUTH (public -- these are how you GET a token in the first place) =====
 
-app.get('/customers', async (req, res) => {
+app.post('/register', async (req, res) => {
+  const { name, email, password, role } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ error: 'Name, email, and password are required' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING user_id, name, email, role, created_at`,
+      [name, email, passwordHash, role || 'staff']
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong creating the account' });
+  }
+});
+
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const user = result.rows[0];
+    const passwordMatches = await bcrypt.compare(password, user.password_hash);
+
+    if (!passwordMatches) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      { user_id: user.user_id, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    res.json({
+      token,
+      user: { user_id: user.user_id, name: user.name, email: user.email, role: user.role },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong logging in' });
+  }
+});
+
+// ===== CUSTOMERS (protected -- requireAuth added as 2nd argument) =====
+
+app.get('/customers', requireAuth, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM customers ORDER BY customer_id');
     res.json(result.rows);
@@ -23,7 +120,7 @@ app.get('/customers', async (req, res) => {
   }
 });
 
-app.get('/customers/:id', async (req, res) => {
+app.get('/customers/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -43,7 +140,7 @@ app.get('/customers/:id', async (req, res) => {
   }
 });
 
-app.post('/customers', async (req, res) => {
+app.post('/customers', requireAuth, async (req, res) => {
   const { name, phone, address } = req.body;
 
   if (!name || !phone) {
@@ -62,7 +159,7 @@ app.post('/customers', async (req, res) => {
   }
 });
 
-app.put('/customers/:id', async (req, res) => {
+app.put('/customers/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { name, phone, address } = req.body;
 
@@ -87,7 +184,7 @@ app.put('/customers/:id', async (req, res) => {
   }
 });
 
-app.delete('/customers/:id', async (req, res) => {
+app.delete('/customers/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -107,9 +204,9 @@ app.delete('/customers/:id', async (req, res) => {
   }
 });
 
-// ===== EMPLOYEES =====
+// ===== EMPLOYEES (protected) =====
 
-app.get('/employees', async (req, res) => {
+app.get('/employees', requireAuth, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM employees ORDER BY employee_id');
     res.json(result.rows);
@@ -119,7 +216,7 @@ app.get('/employees', async (req, res) => {
   }
 });
 
-app.get('/employees/:id', async (req, res) => {
+app.get('/employees/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -139,7 +236,7 @@ app.get('/employees/:id', async (req, res) => {
   }
 });
 
-app.post('/employees', async (req, res) => {
+app.post('/employees', requireAuth, async (req, res) => {
   const { name, phone, address } = req.body;
 
   if (!name) {
@@ -158,7 +255,7 @@ app.post('/employees', async (req, res) => {
   }
 });
 
-app.put('/employees/:id', async (req, res) => {
+app.put('/employees/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { name, phone, address } = req.body;
 
@@ -183,7 +280,7 @@ app.put('/employees/:id', async (req, res) => {
   }
 });
 
-app.delete('/employees/:id', async (req, res) => {
+app.delete('/employees/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -203,9 +300,9 @@ app.delete('/employees/:id', async (req, res) => {
   }
 });
 
-// ===== SERVICES =====
+// ===== SERVICES (protected) =====
 
-app.get('/services', async (req, res) => {
+app.get('/services', requireAuth, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM services ORDER BY service_id');
     res.json(result.rows);
@@ -215,7 +312,7 @@ app.get('/services', async (req, res) => {
   }
 });
 
-app.get('/services/:id', async (req, res) => {
+app.get('/services/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -235,7 +332,7 @@ app.get('/services/:id', async (req, res) => {
   }
 });
 
-app.post('/services', async (req, res) => {
+app.post('/services', requireAuth, async (req, res) => {
   const { name, duration_min, price } = req.body;
 
   if (!name || duration_min === undefined || price === undefined) {
@@ -262,7 +359,7 @@ app.post('/services', async (req, res) => {
   }
 });
 
-app.put('/services/:id', async (req, res) => {
+app.put('/services/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { name, duration_min, price } = req.body;
 
@@ -295,7 +392,7 @@ app.put('/services/:id', async (req, res) => {
   }
 });
 
-app.delete('/services/:id', async (req, res) => {
+app.delete('/services/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -315,18 +412,13 @@ app.delete('/services/:id', async (req, res) => {
   }
 });
 
-// ===== APPOINTMENTS =====
+// ===== APPOINTMENTS (protected) =====
 //
 // This section is more involved than customers/employees/services because
 // an appointment (a) references three other tables at once, (b) needs a
 // real business rule enforced (no double-booking an employee), and (c) is
 // where the notification side-effect is triggered after a successful save.
 
-// Shared SQL fragment: JOIN pulls in the related customer, employee, and
-// service data so the API returns nested objects (per API_DESIGN.md)
-// instead of forcing the frontend to make 3 extra requests per appointment
-// just to display names. LEFT JOIN is used for employees specifically
-// because employee_id is nullable (an appointment can be unassigned).
 const APPOINTMENT_SELECT = `
   SELECT
     a.appointment_id,
@@ -349,8 +441,6 @@ const APPOINTMENT_SELECT = `
   JOIN services s ON a.service_id = s.service_id
 `;
 
-// Reshapes one flat SQL row (with joined columns) into the nested JSON
-// shape defined in API_DESIGN.md.
 function formatAppointment(row) {
   return {
     appointment_id: row.appointment_id,
@@ -371,7 +461,7 @@ function formatAppointment(row) {
   };
 }
 
-app.get('/appointments', async (req, res) => {
+app.get('/appointments', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(`${APPOINTMENT_SELECT} ORDER BY a.start_time`);
     res.json(result.rows.map(formatAppointment));
@@ -381,7 +471,7 @@ app.get('/appointments', async (req, res) => {
   }
 });
 
-app.get('/appointments/today', async (req, res) => {
+app.get('/appointments/today', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       `${APPOINTMENT_SELECT}
@@ -396,11 +486,8 @@ app.get('/appointments/today', async (req, res) => {
   }
 });
 
-app.get('/appointments/week', async (req, res) => {
+app.get('/appointments/week', requireAuth, async (req, res) => {
   try {
-    // "This week" = the next 7 days starting from today. A calendar UI
-    // might later want a proper Mon-Sun week instead -- easy to adjust
-    // this WHERE clause once the frontend defines exactly what it needs.
     const result = await pool.query(
       `${APPOINTMENT_SELECT}
        WHERE a.start_time >= date_trunc('day', now())
@@ -414,7 +501,7 @@ app.get('/appointments/week', async (req, res) => {
   }
 });
 
-app.get('/appointments/:id', async (req, res) => {
+app.get('/appointments/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -434,14 +521,8 @@ app.get('/appointments/:id', async (req, res) => {
   }
 });
 
-// Checks whether a proposed [start, start + duration) window overlaps any
-// EXISTING, non-cancelled appointment for the same employee. Two time
-// ranges [A_start, A_end) and [B_start, B_end) overlap exactly when:
-//   A_start < B_end  AND  B_start < A_end
-// excludeAppointmentId lets PUT (editing an appointment) ignore the
-// appointment's own existing row when checking for conflicts.
 async function hasConflict(employeeId, startTime, durationMin, excludeAppointmentId = null) {
-  if (!employeeId) return false; // unassigned appointments can't conflict
+  if (!employeeId) return false;
 
   const result = await pool.query(
     `SELECT a.appointment_id
@@ -458,7 +539,7 @@ async function hasConflict(employeeId, startTime, durationMin, excludeAppointmen
   return result.rows.length > 0;
 }
 
-app.post('/appointments', async (req, res) => {
+app.post('/appointments', requireAuth, async (req, res) => {
   const { customer_id, employee_id, service_id, start_time } = req.body;
 
   if (!customer_id || !service_id || !start_time) {
@@ -470,10 +551,6 @@ app.post('/appointments', async (req, res) => {
   }
 
   try {
-    // Verify the referenced customer and service actually exist.
-    // The database's foreign key constraints would catch this too, but
-    // checking explicitly here lets us return a clear 404 instead of a
-    // generic 500 from a raw constraint violation.
     const customerCheck = await pool.query('SELECT customer_id FROM customers WHERE customer_id = $1', [customer_id]);
     if (customerCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Customer not found' });
@@ -492,13 +569,10 @@ app.post('/appointments', async (req, res) => {
       }
     }
 
-    // Business rule: cannot double-book an employee.
     if (await hasConflict(employee_id, start_time, durationMin)) {
       return res.status(409).json({ error: 'This employee already has an appointment during that time' });
     }
 
-    // status is deliberately NOT accepted from the client -- it always
-    // starts as 'scheduled' via the column's DEFAULT, set server-side only.
     const insertResult = await pool.query(
       `INSERT INTO appointments (customer_id, employee_id, service_id, start_time)
        VALUES ($1, $2, $3, $4)
@@ -512,9 +586,6 @@ app.post('/appointments', async (req, res) => {
 
     res.status(201).json(appointment);
 
-    // Fire-and-forget: this happens AFTER the response is already sent.
-    // If this fails, the appointment still exists -- exactly per our
-    // architecture decision that notifications never affect booking success.
     notifyNewAppointment(appointment);
   } catch (err) {
     console.error(err);
@@ -522,7 +593,7 @@ app.post('/appointments', async (req, res) => {
   }
 });
 
-app.put('/appointments/:id', async (req, res) => {
+app.put('/appointments/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { customer_id, employee_id, service_id, start_time } = req.body;
 
@@ -537,9 +608,6 @@ app.put('/appointments/:id', async (req, res) => {
     }
     const durationMin = serviceCheck.rows[0].duration_min;
 
-    // Business rule: cannot move this appointment onto a slot that
-    // conflicts with a DIFFERENT appointment (excludeAppointmentId lets it
-    // ignore a conflict with its own current row).
     if (await hasConflict(employee_id, start_time, durationMin, id)) {
       return res.status(409).json({ error: 'This employee already has an appointment during that time' });
     }
@@ -564,11 +632,7 @@ app.put('/appointments/:id', async (req, res) => {
   }
 });
 
-// Cancelling is a distinct business ACTION, not a generic field edit --
-// it has its own endpoint (per API_DESIGN.md) so it's easy to attach
-// cancel-specific logic later (e.g. freeing the slot is automatic, since
-// hasConflict() already ignores rows with status = 'cancelled').
-app.patch('/appointments/:id/cancel', async (req, res) => {
+app.patch('/appointments/:id/cancel', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -590,7 +654,7 @@ app.patch('/appointments/:id/cancel', async (req, res) => {
   }
 });
 
-app.delete('/appointments/:id', async (req, res) => {
+app.delete('/appointments/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
