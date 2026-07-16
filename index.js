@@ -3,6 +3,7 @@ import { pool } from './db.js';
 import { notifyNewAppointment } from './notifications.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import cors from 'cors';
 
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -35,6 +36,7 @@ function requireAuth(req, res, next) {
 const app = express();
 const PORT = 3000;
 
+app.use(cors());
 app.use(express.json());
 
 // Public health check -- no auth needed.
