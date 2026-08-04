@@ -8,8 +8,6 @@ import cors from 'cors';
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
 
-  // Tokens are sent as: "Authorization: Bearer <token>"
-  // If there's no header, or it doesn't start with "Bearer ", reject immediately.
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'No token provided' });
   }
@@ -17,20 +15,20 @@ function requireAuth(req, res, next) {
   const token = authHeader.split(' ')[1];
 
   try {
-    // jwt.verify checks the signature AND expiry in one step. If the token
-    // was tampered with, or signed with a different secret, or expired,
-    // this throws -- caught below.
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Attach the decoded user info to the request object itself, so any
-    // route handler further down the chain can access req.user without
-    // needing to re-verify anything.
     req.user = decoded;
-
-    next(); // proceed to the actual route handler
+    next();
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
+}
+
+function requireOwner(req, res) {
+  if (req.user.role !== 'owner') {
+    res.status(403).json({ error: 'Only the owner can perform this action' });
+    return true;
+  }
+  return false;
 }
 
 const app = express();
@@ -39,39 +37,11 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// Public health check -- no auth needed.
 app.get('/', (req, res) => {
   res.send('Appointment SaaS API is running');
 });
 
-// ===== AUTH (public -- these are how you GET a token in the first place) =====
-
-app.post('/register', async (req, res) => {
-  const { name, email, password, role } = req.body;
-
-  if (!name || !email || !password) {
-    return res.status(400).json({ error: 'Name, email, and password are required' });
-  }
-
-  try {
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role)
-       VALUES ($1, $2, $3, $4)
-       RETURNING user_id, name, email, role, created_at`,
-      [name, email, passwordHash, role || 'staff']
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    if (err.code === '23505') {
-      return res.status(409).json({ error: 'An account with this email already exists' });
-    }
-    console.error(err);
-    res.status(500).json({ error: 'Something went wrong creating the account' });
-  }
-});
+// ===== AUTH =====
 
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
@@ -110,7 +80,36 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// ===== CUSTOMERS (protected -- requireAuth added as 2nd argument) =====
+app.post('/register', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
+  const { name, email, password, role, employee_id } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ error: 'Name, email, and password are required' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role, employee_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING user_id, name, email, role, employee_id, created_at`,
+      [name, email, passwordHash, role || 'staff', employee_id || null]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong creating the account' });
+  }
+});
+
+// ===== CUSTOMERS =====
 
 app.get('/customers', requireAuth, async (req, res) => {
   try {
@@ -126,10 +125,7 @@ app.get('/customers/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
-    const result = await pool.query(
-      'SELECT * FROM customers WHERE customer_id = $1',
-      [id]
-    );
+    const result = await pool.query('SELECT * FROM customers WHERE customer_id = $1', [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Customer not found' });
@@ -187,6 +183,8 @@ app.put('/customers/:id', requireAuth, async (req, res) => {
 });
 
 app.delete('/customers/:id', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { id } = req.params;
 
   try {
@@ -206,9 +204,11 @@ app.delete('/customers/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ===== EMPLOYEES (protected) =====
+// ===== EMPLOYEES =====
 
 app.get('/employees', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   try {
     const result = await pool.query('SELECT * FROM employees ORDER BY employee_id');
     res.json(result.rows);
@@ -219,13 +219,12 @@ app.get('/employees', requireAuth, async (req, res) => {
 });
 
 app.get('/employees/:id', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { id } = req.params;
 
   try {
-    const result = await pool.query(
-      'SELECT * FROM employees WHERE employee_id = $1',
-      [id]
-    );
+    const result = await pool.query('SELECT * FROM employees WHERE employee_id = $1', [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Employee not found' });
@@ -239,6 +238,8 @@ app.get('/employees/:id', requireAuth, async (req, res) => {
 });
 
 app.post('/employees', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { name, phone, address } = req.body;
 
   if (!name) {
@@ -258,6 +259,8 @@ app.post('/employees', requireAuth, async (req, res) => {
 });
 
 app.put('/employees/:id', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { id } = req.params;
   const { name, phone, address } = req.body;
 
@@ -283,6 +286,8 @@ app.put('/employees/:id', requireAuth, async (req, res) => {
 });
 
 app.delete('/employees/:id', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { id } = req.params;
 
   try {
@@ -302,7 +307,9 @@ app.delete('/employees/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ===== SERVICES (protected) =====
+// ===== SERVICES =====
+// BOTH roles can VIEW services (staff need this for the appointment
+// booking dropdown). Only the owner can create/edit/delete services.
 
 app.get('/services', requireAuth, async (req, res) => {
   try {
@@ -318,10 +325,7 @@ app.get('/services/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
-    const result = await pool.query(
-      'SELECT * FROM services WHERE service_id = $1',
-      [id]
-    );
+    const result = await pool.query('SELECT * FROM services WHERE service_id = $1', [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Service not found' });
@@ -334,7 +338,87 @@ app.get('/services/:id', requireAuth, async (req, res) => {
   }
 });
 
+app.get('/public/availability', async (req, res) => {
+  const { service_id, employee_id, date } = req.query;
+
+  if (!service_id || !date) {
+    return res.status(400).json({ error: 'service_id and date are required' });
+  }
+
+  try {
+    const serviceResult = await pool.query('SELECT duration_min FROM services WHERE service_id = $1', [service_id]);
+    if (serviceResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+    const durationMin = serviceResult.rows[0].duration_min;
+
+    // JavaScript's Date.getDay() returns 0 (Sunday) through 6 (Saturday),
+    // matching exactly how we designed business_hours.day_of_week.
+    const dayOfWeek = new Date(date).getDay();
+
+    const hoursResult = await pool.query(
+      'SELECT is_closed, open_time, close_time FROM business_hours WHERE day_of_week = $1',
+      [dayOfWeek]
+    );
+    const hours = hoursResult.rows[0];
+
+    if (!hours || hours.is_closed) {
+      return res.json({ slots: [] });
+    }
+
+    // Build actual JS Date objects for "open" and "close" on the requested day.
+    const openTime = new Date(`${date}T${hours.open_time}`);
+    const closeTime = new Date(`${date}T${hours.close_time}`);
+
+    const slots = [];
+    const SLOT_INTERVAL_MINUTES = 15;
+
+    for (
+      let slotStart = new Date(openTime);
+      new Date(slotStart.getTime() + durationMin * 60000) <= closeTime;
+      slotStart = new Date(slotStart.getTime() + SLOT_INTERVAL_MINUTES * 60000)
+    ) {
+      // Consistent with hasConflict(): no employee selected means no
+      // conflict is possible, so every slot in business hours qualifies.
+      const conflict = employee_id
+        ? await hasConflict(employee_id, slotStart.toISOString(), durationMin)
+        : false;
+
+      if (!conflict) {
+        slots.push(slotStart.toISOString());
+      }
+    }
+
+    res.json({ slots });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong computing availability' });
+  }
+});
+
+app.get('/public/services', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT service_id, name, duration_min, price FROM services ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong fetching services' });
+  }
+});
+
+app.get('/public/employees', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT employee_id, name FROM employees ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong fetching employees' });
+  }
+});
+
 app.post('/services', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { name, duration_min, price } = req.body;
 
   if (!name || duration_min === undefined || price === undefined) {
@@ -361,7 +445,72 @@ app.post('/services', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/public/appointments', async (req, res) => {
+  const { name, phone, service_id, employee_id, start_time } = req.body;
+
+  if (!name || !phone || !service_id || !start_time) {
+    return res.status(400).json({ error: 'name, phone, service_id, and start_time are required' });
+  }
+
+  if (new Date(start_time) < new Date()) {
+    return res.status(400).json({ error: 'Cannot book an appointment in the past' });
+  }
+
+  try {
+    const serviceCheck = await pool.query('SELECT duration_min FROM services WHERE service_id = $1', [service_id]);
+    if (serviceCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+    const durationMin = serviceCheck.rows[0].duration_min;
+
+    if (employee_id) {
+      const employeeCheck = await pool.query('SELECT employee_id FROM employees WHERE employee_id = $1', [employee_id]);
+      if (employeeCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'Employee not found' });
+      }
+    }
+
+    if (await hasConflict(employee_id, start_time, durationMin)) {
+      return res.status(409).json({ error: 'That time slot is no longer available' });
+    }
+
+    // Find an existing customer by phone, or create a new one.
+    // This is what prevents duplicate customer rows for repeat visitors.
+    let customerResult = await pool.query('SELECT customer_id FROM customers WHERE phone = $1', [phone]);
+
+    let customerId;
+    if (customerResult.rows.length > 0) {
+      customerId = customerResult.rows[0].customer_id;
+    } else {
+      const newCustomer = await pool.query(
+        'INSERT INTO customers (name, phone) VALUES ($1, $2) RETURNING customer_id',
+        [name, phone]
+      );
+      customerId = newCustomer.rows[0].customer_id;
+    }
+
+    const insertResult = await pool.query(
+      `INSERT INTO appointments (customer_id, employee_id, service_id, start_time)
+       VALUES ($1, $2, $3, $4)
+       RETURNING appointment_id`,
+      [customerId, employee_id || null, service_id, start_time]
+    );
+
+    const newId = insertResult.rows[0].appointment_id;
+    const fullResult = await pool.query(`${APPOINTMENT_SELECT} WHERE a.appointment_id = $1`, [newId]);
+    const appointment = formatAppointment(fullResult.rows[0]);
+
+    res.status(201).json(appointment);
+    notifyNewAppointment(appointment);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong creating the appointment' });
+  }
+});
+
 app.put('/services/:id', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { id } = req.params;
   const { name, duration_min, price } = req.body;
 
@@ -395,6 +544,8 @@ app.put('/services/:id', requireAuth, async (req, res) => {
 });
 
 app.delete('/services/:id', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
   const { id } = req.params;
 
   try {
@@ -414,12 +565,7 @@ app.delete('/services/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ===== APPOINTMENTS (protected) =====
-//
-// This section is more involved than customers/employees/services because
-// an appointment (a) references three other tables at once, (b) needs a
-// real business rule enforced (no double-booking an employee), and (c) is
-// where the notification side-effect is triggered after a successful save.
+// ===== APPOINTMENTS =====
 
 const APPOINTMENT_SELECT = `
   SELECT
@@ -463,9 +609,20 @@ function formatAppointment(row) {
   };
 }
 
+function staffFilterClause(req, params) {
+  if (req.user.role !== 'staff') return '';
+  params.push(req.user.user_id);
+  return ` AND a.employee_id = (SELECT employee_id FROM users WHERE user_id = $${params.length})`;
+}
+
 app.get('/appointments', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(`${APPOINTMENT_SELECT} ORDER BY a.start_time`);
+    const params = [];
+    let query = `${APPOINTMENT_SELECT} WHERE 1=1`;
+    query += staffFilterClause(req, params);
+    query += ' ORDER BY a.start_time';
+
+    const result = await pool.query(query, params);
     res.json(result.rows.map(formatAppointment));
   } catch (err) {
     console.error(err);
@@ -475,12 +632,14 @@ app.get('/appointments', requireAuth, async (req, res) => {
 
 app.get('/appointments/today', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `${APPOINTMENT_SELECT}
+    const params = [];
+    let query = `${APPOINTMENT_SELECT}
        WHERE a.start_time >= date_trunc('day', now())
-         AND a.start_time < date_trunc('day', now()) + interval '1 day'
-       ORDER BY a.start_time`
-    );
+         AND a.start_time < date_trunc('day', now()) + interval '1 day'`;
+    query += staffFilterClause(req, params);
+    query += ' ORDER BY a.start_time';
+
+    const result = await pool.query(query, params);
     res.json(result.rows.map(formatAppointment));
   } catch (err) {
     console.error(err);
@@ -490,12 +649,14 @@ app.get('/appointments/today', requireAuth, async (req, res) => {
 
 app.get('/appointments/week', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `${APPOINTMENT_SELECT}
+    const params = [];
+    let query = `${APPOINTMENT_SELECT}
        WHERE a.start_time >= date_trunc('day', now())
-         AND a.start_time < date_trunc('day', now()) + interval '7 days'
-       ORDER BY a.start_time`
-    );
+         AND a.start_time < date_trunc('day', now()) + interval '7 days'`;
+    query += staffFilterClause(req, params);
+    query += ' ORDER BY a.start_time';
+
+    const result = await pool.query(query, params);
     res.json(result.rows.map(formatAppointment));
   } catch (err) {
     console.error(err);
@@ -507,10 +668,7 @@ app.get('/appointments/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
-    const result = await pool.query(
-      `${APPOINTMENT_SELECT} WHERE a.appointment_id = $1`,
-      [id]
-    );
+    const result = await pool.query(`${APPOINTMENT_SELECT} WHERE a.appointment_id = $1`, [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Appointment not found' });

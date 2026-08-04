@@ -12,5 +12,29 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  backend:
+    build: .
+    container_name: appointment_backend
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgres://appointment_admin:devpassword123@db:5432/appointment_db
+      JWT_SECRET: ${JWT_SECRET}
+    ports:
+      - "3000:3000"
+
+  frontend:
+    build:
+      context: ../appointment-saas-frontend
+      args:
+        VITE_API_URL: http://localhost:3000
+    container_name: appointment_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
 volumes:
   pgdata:
