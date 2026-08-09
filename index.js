@@ -5,6 +5,8 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
 
+console.log('DATABASE_URL check:', process.env.DATABASE_URL);
+
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
 
