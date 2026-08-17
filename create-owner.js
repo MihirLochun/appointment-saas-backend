@@ -5,13 +5,14 @@ async function createOwner() {
   const name = 'Mihir Owner';
   const email = 'mihir@example.com';
   const password = 'supersecret123';
+  const businessId = 1; // "Demo Barbershop", created by the businesses migration
 
   const passwordHash = await bcrypt.hash(password, 10);
 
   await pool.query(
-    `INSERT INTO users (name, email, password_hash, role)
-     VALUES ($1, $2, $3, 'owner')`,
-    [name, email, passwordHash]
+    `INSERT INTO users (name, email, password_hash, role, business_id)
+     VALUES ($1, $2, $3, 'owner', $4)`,
+    [name, email, passwordHash, businessId]
   );
 
   console.log('Owner account created successfully.');
