@@ -5,6 +5,7 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
 
+
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
 
@@ -19,6 +20,11 @@ function requireAuth(req, res, next) {
     // login time. This means every route below can scope its queries to
     // req.user.business_id without an extra database lookup.
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (!decoded.user_id || !decoded.business_id || !decoded.role) {
+    return res.status(401).json({ error: 'Invalid token' });
+    }
+
     req.user = decoded;
     next();
   } catch (err) {
@@ -147,6 +153,33 @@ app.get('/admin/businesses', requireAuth, async (req, res) => {
   }
 });
 
+app.patch('/business', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
+  const { description, logo_url } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE businesses SET description = $1, logo_url = $2, updated_at = now()
+       WHERE business_id = $3 RETURNING *`,
+      [description || null, logo_url || null, req.user.business_id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong updating your business' });
+  }
+});
+
+app.get('/business', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM businesses WHERE business_id = $1', [req.user.business_id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong fetching your business' });
+  }
+});
 // Creates a brand-new business AND its first owner account together, in a
 // single transaction. This is the "allocate a dashboard" action: a new
 // businesses row plus a new users row (role 'owner') linked to it.
