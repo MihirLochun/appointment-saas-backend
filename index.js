@@ -22,7 +22,7 @@ function requireAuth(req, res, next) {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     if (!decoded.user_id || !decoded.business_id || !decoded.role) {
-    return res.status(401).json({ error: 'Invalid token' });
+      return res.status(401).json({ error: 'Invalid token' });
     }
 
     req.user = decoded;
@@ -137,9 +137,9 @@ app.post('/register', requireAuth, async (req, res) => {
 });
 
 // ===== SUPER ADMIN =====
-// Platform-level routes for creating and listing businesses. Only
-// accessible to the super_admin role -- ordinary owners/staff never see
-// or reach these.
+// Platform-level routes for creating, listing, and managing businesses.
+// Only accessible to the super_admin role -- ordinary owners/staff never
+// see or reach these.
 
 app.get('/admin/businesses', requireAuth, async (req, res) => {
   if (requireSuperAdmin(req, res)) return;
@@ -153,33 +153,26 @@ app.get('/admin/businesses', requireAuth, async (req, res) => {
   }
 });
 
-app.patch('/business', requireAuth, async (req, res) => {
-  if (requireOwner(req, res)) return;
-
-  const { description, logo_url } = req.body;
+app.get('/admin/businesses/:id', requireAuth, async (req, res) => {
+  if (requireSuperAdmin(req, res)) return;
 
   try {
     const result = await pool.query(
-      `UPDATE businesses SET description = $1, logo_url = $2, updated_at = now()
-       WHERE business_id = $3 RETURNING *`,
-      [description || null, logo_url || null, req.user.business_id]
+      'SELECT * FROM businesses WHERE business_id = $1',
+      [req.params.id]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Business not found' });
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Something went wrong updating your business' });
+    res.status(500).json({ error: 'Something went wrong fetching the business' });
   }
 });
 
-app.get('/business', requireAuth, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM businesses WHERE business_id = $1', [req.user.business_id]);
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Something went wrong fetching your business' });
-  }
-});
 // Creates a brand-new business AND its first owner account together, in a
 // single transaction. This is the "allocate a dashboard" action: a new
 // businesses row plus a new users row (role 'owner') linked to it.
@@ -230,6 +223,111 @@ app.post('/admin/businesses', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Something went wrong creating the business' });
   } finally {
     client.release();
+  }
+});
+
+// Edit a business's core details (name/slug/description). Used by the
+// "Edit" button in BusinessTable.jsx.
+//
+// NOTE: this assumes `businesses.name`, `.slug`, and `.description`
+// already exist (they do, per the original schema). If you see a
+// "column does not exist" error here, check your migrations.
+app.patch('/admin/businesses/:id', requireAuth, async (req, res) => {
+  if (requireSuperAdmin(req, res)) return;
+
+  const { name, slug, description } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE businesses
+       SET name = $1,
+           slug = $2,
+           description = $3,
+           updated_at = now()
+       WHERE business_id = $4
+       RETURNING *`,
+      [name, slug, description, req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Business not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Slug already exists' });
+    }
+
+    res.status(500).json({ error: 'Something went wrong updating the business' });
+  }
+});
+
+// Suspend/activate a business. Used by the "Suspend"/"Activate" button
+// in BusinessTable.jsx.
+//
+// IMPORTANT: this requires an `is_active` column on `businesses`. That
+// column is NOT in the original schema list from the handoff doc
+// (business_id, name, slug, description, logo_url, settings). If this
+// route 500s with something like `column "is_active" does not exist`,
+// you need a migration to add it first, e.g.:
+//
+//   pgm.addColumn('businesses', {
+//     is_active: { type: 'boolean', notNull: true, default: true },
+//   });
+app.patch('/admin/businesses/:id/status', requireAuth, async (req, res) => {
+  if (requireSuperAdmin(req, res)) return;
+
+  const { is_active } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE businesses
+       SET is_active = $1,
+           updated_at = now()
+       WHERE business_id = $2
+       RETURNING *`,
+      [is_active, req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Business not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong updating status' });
+  }
+});
+
+app.get('/business', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM businesses WHERE business_id = $1', [req.user.business_id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong fetching your business' });
+  }
+});
+
+app.patch('/business', requireAuth, async (req, res) => {
+  if (requireOwner(req, res)) return;
+
+  const { description, logo_url } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE businesses SET description = $1, logo_url = $2, updated_at = now()
+       WHERE business_id = $3 RETURNING *`,
+      [description || null, logo_url || null, req.user.business_id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong updating your business' });
   }
 });
 
@@ -996,6 +1094,10 @@ app.put('/appointments/:id', requireAuth, async (req, res) => {
   }
 });
 
+// This route was the one that had the bug: two unrelated admin/businesses
+// routes were accidentally pasted INSIDE this handler's try block. They've
+// been moved back up to the SUPER ADMIN section above, as standalone
+// top-level app.patch(...) calls. This handler is now self-contained again.
 app.patch('/appointments/:id/cancel', requireAuth, async (req, res) => {
   const { id } = req.params;
 
